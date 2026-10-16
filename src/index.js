@@ -146,17 +146,26 @@ export default {
       let pageBlocks = [];
       if (aiMode !== "manual" && env.AI) {
         try {
-          const { transcript, description } = await getYouTubeContent(videoId);
+          const { transcript, description, title } = await getYouTubeContent(
+            videoId,
+            env.TRANSCRIPT_API_KEY,
+          );
+
+          if (title && (!videoTitle || videoTitle === "YouTube Video")) {
+            videoTitle = title;
+          }
 
           // Concise, keyword-anchored system prompt
-          const systemPrompt = `You are a concise technical note-taker. 
-Extract only the essential insights and terminology spoken in the video transcript.
+          const systemPrompt = `You are an expert technical note-taker who turns video transcripts into clean, well-structured study notes in Markdown.
 
-Strict Output Rules:
-1. Every bullet must be short, dense, and punchy (maximum 12 to 18 words per line). No paragraphs or run-on sentences.
-2. Bold the specific **key terms**, **metrics**, **tools**, or **mechanisms** discussed.
-3. Eliminate intro filler, meta-talk (e.g., "The speaker discusses", "In this video"), and obvious context.
-4. Output strictly as bullet points starting with "- ". Do not use markdown headers (# or ##).`;
+Formatting rules:
+1. Group related ideas under short section headings written as "## Heading".
+2. Under each heading, use "- " bullets. Use nested bullets with two-space indentation for sub-points.
+3. Use numbered lists "1. " only for sequential steps or rankings.
+4. Bold the **key terms**, **tools**, **metrics**, or **mechanisms** with **double asterisks**.
+5. Wrap exact commands, code, file names, or identifiers in \`backticks\`.
+6. Keep every line short and dense (roughly 8-18 words). No paragraphs, no filler, no meta-talk ("the speaker says", "in this video").
+7. Never repeat the video title or add a top-level "# " heading.`;
 
           let contextBody = `Video Title: "${videoTitle}"\nURL: ${cleanUrl}\n\n`;
           if (description) {
@@ -168,8 +177,8 @@ Strict Output Rules:
 
           contextBody +=
             aiMode === "short_summary"
-              ? "Task: Output exactly 3 to 5 ultra-concise bullet points capturing the core takeaway. Keep each point under 15 words."
-              : "Task: Output structured bullet points grouped by key points/concepts mentioned. Keep each bullet point short, direct, and keyword-heavy.";
+              ? 'Task: Output 3 to 5 ultra-concise bullets capturing the core takeaway. Start directly with "- " bullets (no headings). Keep each under 15 words.'
+              : "Task: Output structured Markdown study notes using '## ' section headings and '-' bullets (plus nested sub-bullets where useful). Be short, direct, and keyword-heavy.";
 
           const aiResponse = await env.AI.run(
             "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
@@ -178,8 +187,8 @@ Strict Output Rules:
                 { role: "system", content: systemPrompt },
                 { role: "user", content: contextBody },
               ],
-              max_tokens: 600, // Reduced from 1200 to enforce concise brevity
-              temperature: 0.1, // Lowered for direct, factual extraction without embellishment
+              max_tokens: 800, // Room for a few sections of structured notes
+              temperature: 0.1, // Low, for direct factual extraction
             },
           );
 
@@ -187,8 +196,32 @@ Strict Output Rules:
           if (rawText) {
             pageBlocks.push({
               object: "block",
-              type: "heading_3",
-              heading_3: {
+              type: "callout",
+              callout: {
+                icon: { type: "emoji", emoji: "🎬" },
+                color: "gray_background",
+                rich_text: [
+                  {
+                    type: "text",
+                    text: { content: videoTitle || "YouTube Video", link: { url: cleanUrl } },
+                  },
+                  { type: "text", text: { content: "\n" } },
+                  {
+                    type: "text",
+                    text: {
+                      content: "Watch on YouTube",
+                      link: { url: cleanUrl },
+                    },
+                    annotations: { color: "blue" },
+                  },
+                ],
+              },
+            });
+
+            pageBlocks.push({
+              object: "block",
+              type: "heading_2",
+              heading_2: {
                 rich_text: [
                   {
                     type: "text",
@@ -203,21 +236,7 @@ Strict Output Rules:
               },
             });
 
-            const lines = rawText.split("\n");
-            for (const line of lines) {
-              const clean = line.replace(/^[\*\-\•\#]+\s*/, "").trim();
-              if (clean.length > 0 && !clean.startsWith("```")) {
-                pageBlocks.push({
-                  object: "block",
-                  type: "bulleted_list_item",
-                  bulleted_list_item: {
-                    rich_text: parseMarkdownToRichText(
-                      clean.substring(0, 1900),
-                    ),
-                  },
-                });
-              }
-            }
+            pageBlocks.push(...markdownToBlocks(rawText));
           }
         } catch (aiErr) {
           console.error("Workers AI error:", aiErr);
@@ -256,8 +275,12 @@ Strict Output Rules:
         properties: properties,
       };
 
-      if (pageBlocks.length > 0) {
-        notionPayload.children = pageBlocks;
+      // Notion allows at most 100 blocks per request, so send the first batch
+      // on creation and append the remainder afterwards.
+      const initialChildren = takeBlocks(pageBlocks, 100);
+      const remainingBlocks = pageBlocks.slice(initialChildren.length);
+      if (initialChildren.length > 0) {
+        notionPayload.children = initialChildren;
       }
 
       const notionRes = await fetch("https://api.notion.com/v1/pages", {
@@ -283,6 +306,30 @@ Strict Output Rules:
         );
       }
 
+      // Append any leftover blocks in batches of 100.
+      while (remainingBlocks.length > 0) {
+        const batch = takeBlocks(remainingBlocks, 100);
+        if (batch.length === 0) break;
+        remainingBlocks.splice(0, batch.length);
+
+        const appendRes = await fetch(
+          "https://api.notion.com/v1/blocks/" + notionData.id + "/children",
+          {
+            method: "PATCH",
+            headers: {
+              Authorization: "Bearer " + notionKey,
+              "Content-Type": "application/json",
+              "Notion-Version": "2022-06-28",
+            },
+            body: JSON.stringify({ children: batch }),
+          },
+        );
+        if (!appendRes.ok) {
+          console.warn("Failed to append extra Notion blocks:", await appendRes.text());
+          break;
+        }
+      }
+
       const cleanId = notionData.id.replace(/-/g, "");
       const appUrl = "notion://www.notion.so/" + cleanId;
 
@@ -299,99 +346,474 @@ Strict Output Rules:
   },
 };
 
+// Constants for YouTube access
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const ANDROID_VR_UA =
+  "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; GB) gzip";
+const ANDROID_VR_CLIENT = {
+  clientName: "ANDROID_VR",
+  clientVersion: "1.60.19",
+  androidSdkVersion: 32,
+  hl: "en",
+  gl: "US",
+};
+
 // Helper: Extract English transcript and description from YouTube video
-async function getYouTubeContent(videoId) {
+async function getYouTubeContent(videoId, transcriptApiKey) {
   let transcript = "";
   let description = "";
+  let title = "";
 
-  if (!videoId) return { transcript, description };
+  if (!videoId) return { transcript, description, title };
 
+  // 1. Primary transcript source: FreeTranscriptAPI.
+  //    Its servers handle YouTube's PoToken / datacenter-IP bot checks that
+  //    make direct caption requests return empty bodies from Workers. It is
+  //    keyless (anonymous IP rate limit) but accepts an optional API key for
+  //    higher limits via the TRANSCRIPT_API_KEY secret.
+  const apiResult = await getFreeTranscript(videoId, transcriptApiKey);
+  if (apiResult) {
+    transcript = apiResult.text.substring(0, 24000);
+    title = apiResult.title;
+  }
+
+  // 2. Watch page: used for the description and as a caption-track fallback
+  let pageTracks = [];
   try {
     const videoPageRes = await fetch(
-      `[https://www.youtube.com/watch?v=$](https://www.youtube.com/watch?v=$){videoId}`,
+      `https://www.youtube.com/watch?v=${videoId}`,
       {
         headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "User-Agent": BROWSER_UA,
           "Accept-Language": "en-US,en;q=0.9",
         },
       },
     );
     const html = await videoPageRes.text();
 
-    const descMatch = html.match(/"shortDescription":"(.*?)"/);
+    const descMatch = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
     if (descMatch && descMatch[1]) {
-      description = descMatch[1]
-        .replace(/\\n/g, "\n")
-        .replace(/\\"/g, '"')
-        .substring(0, 1500);
+      description = decodeEscapedString(descMatch[1]).substring(0, 1500);
     }
 
-    const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
+    const captionTracksMatch = html.match(/"captionTracks":\s*(\[[\s\S]*?\])/);
     if (captionTracksMatch && captionTracksMatch[1]) {
-      const captionTracks = JSON.parse(captionTracksMatch[1]);
-      const track =
-        captionTracks.find((t) => t.languageCode === "en") || captionTracks[0];
-
-      if (track && track.baseUrl) {
-        const transcriptRes = await fetch(track.baseUrl);
-        const transcriptXml = await transcriptRes.text();
-
-        const textMatches = [
-          ...transcriptXml.matchAll(/<text[^>]*>(.*?)<\/text>/g),
-        ];
-        const rawLines = textMatches.map((m) =>
-          m[1]
-            .replace(/&amp;/g, "&")
-            .replace(/&lt;/g, "<")
-            .replace(/&gt;/g, ">")
-            .replace(/&#39;/g, "'")
-            .replace(/&quot;/g, '"')
-            .replace(/\n/g, " ")
-            .trim(),
-        );
-
-        transcript = rawLines.join(" ").substring(0, 24000);
-      }
+      try {
+        pageTracks = JSON.parse(captionTracksMatch[1]);
+      } catch (e) {}
     }
   } catch (e) {
-    console.warn("Transcript extraction error:", e);
+    console.warn("Watch page extraction error:", e);
   }
 
-  return { transcript, description };
+  // 3. Fallback transcript source: InnerTube player via the Android VR client.
+  //    Watch-page tracks carry `exp=xpe`, which require a PoToken and return
+  //    empty bodies to server-side requests; the VR client sometimes still
+  //    returns usable caption URLs. Only used when the API above failed.
+  if (!transcript) {
+    const innerTubeTracks = await fetchCaptionTracks(videoId);
+
+    // 4. Build a de-duplicated, English-first candidate list and try each
+    //    source until a transcript is actually returned.
+    const candidates = [];
+    const seenUrls = new Set();
+    const ordered = [
+      ...innerTubeTracks.filter((t) => isEnglish(t)),
+      ...pageTracks.filter((t) => isEnglish(t)),
+      ...innerTubeTracks,
+      ...pageTracks,
+    ];
+    for (const track of ordered) {
+      if (track && track.baseUrl && !seenUrls.has(track.baseUrl)) {
+        seenUrls.add(track.baseUrl);
+        candidates.push(track);
+      }
+    }
+
+    for (const track of candidates) {
+      try {
+        const transcriptRes = await fetch(track.baseUrl, {
+          headers: {
+            "User-Agent": ANDROID_VR_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+          },
+        });
+        const transcriptBody = await transcriptRes.text();
+        const parsed = parseTranscript(transcriptBody);
+        if (parsed) {
+          transcript = parsed.substring(0, 24000);
+          break;
+        }
+      } catch (e) {
+        console.warn("Transcript fetch error:", e);
+      }
+    }
+  }
+
+  return { transcript, description, title };
 }
 
-function parseMarkdownToRichText(text) {
-  const parts = [];
-  const regex = /\*\*(.*?)\*\*/g;
-  let lastIndex = 0;
+// FreeTranscriptAPI: keyless YouTube transcript endpoint. Returns
+// { language, title, transcript: [{ text, start, duration }] }.
+async function getFreeTranscript(videoId, apiKey) {
+  try {
+    const headers = { "User-Agent": BROWSER_UA, Accept: "application/json" };
+    if (apiKey) headers.Authorization = "Bearer " + apiKey.trim();
+
+    const res = await fetch(
+      "https://api.freetranscriptapi.com/v1/transcript?video_url=" +
+        encodeURIComponent(videoId),
+      { headers },
+    );
+    if (!res.ok) {
+      console.warn("FreeTranscriptAPI HTTP " + res.status);
+      return null;
+    }
+
+    const data = await res.json();
+    const segments = Array.isArray(data && data.transcript)
+      ? data.transcript
+      : [];
+    const text = segments
+      .map((s) => (s && s.text ? s.text : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!text) return null;
+    return { text, title: (data && data.title) || "" };
+  } catch (e) {
+    console.warn("FreeTranscriptAPI error:", e);
+    return null;
+  }
+}
+
+
+function isEnglish(track) {
+  return (
+    track &&
+    typeof track.languageCode === "string" &&
+    track.languageCode.toLowerCase().startsWith("en")
+  );
+}
+
+async function fetchCaptionTracks(videoId) {
+  try {
+    const res = await fetch(
+      "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": ANDROID_VR_UA,
+        },
+        body: JSON.stringify({
+          context: { client: ANDROID_VR_CLIENT },
+          videoId: videoId,
+          contentCheckOk: true,
+          racyCheckOk: true,
+        }),
+      },
+    );
+    const data = await res.json();
+    return (
+      (data &&
+        data.captions &&
+        data.captions.playerCaptionsTracklistRenderer &&
+        data.captions.playerCaptionsTracklistRenderer.captionTracks) ||
+      []
+    );
+  } catch (e) {
+    console.warn("InnerTube caption error:", e);
+    return [];
+  }
+}
+
+function decodeEscapedString(str) {
+  try {
+    return JSON.parse('"' + str + '"');
+  } catch (e) {
+    return str
+      .replace(/\\n/g, "\n")
+      .replace(/\\"/g, '"')
+      .replace(/\\\//g, "/")
+      .replace(/\\\\/g, "\\");
+  }
+}
+
+function decodeEntities(str) {
+  return str
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) =>
+      String.fromCharCode(parseInt(h, 16)),
+    )
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+// YouTube returns either json3 or srv3/legacy XML. Handle both, because the
+// Android VR caption URLs come back as srv3 (`<p t=".." d="..">text</p>`)
+// which the old `<text>`-only parser silently dropped.
+function parseTranscript(body) {
+  const text = (body || "").trim();
+  if (!text) return "";
+
+  if (text.startsWith("{")) {
+    try {
+      const data = JSON.parse(text);
+      return (data.events || [])
+        .filter((ev) => Array.isArray(ev.segs))
+        .map((ev) => ev.segs.map((s) => s.utf8 || "").join(""))
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    } catch (e) {}
+  }
+
+  const lines = [];
+  const blockRegex = /<(?:p|text)\b[^>]*>([\s\S]*?)<\/(?:p|text)>/g;
   let match;
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push({
-        type: "text",
-        text: { content: text.substring(lastIndex, match.index) },
-        annotations: { bold: false },
-      });
-    }
-    if (match[1].length > 0) {
-      parts.push({
-        type: "text",
-        text: { content: match[1] },
-        annotations: { bold: true },
-      });
-    }
-    lastIndex = regex.lastIndex;
+  while ((match = blockRegex.exec(text)) !== null) {
+    const segment = decodeEntities(match[1].replace(/<[^>]*>/g, " "))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (segment) lines.push(segment);
   }
-  if (lastIndex < text.length) {
-    parts.push({
-      type: "text",
-      text: { content: text.substring(lastIndex) },
-      annotations: { bold: false },
-    });
-  }
-  return parts.length > 0 ? parts : [{ type: "text", text: { content: text } }];
+  return lines.join(" ");
 }
+
+// Convert inline Markdown (bold, italic, strikethrough, code, links) into
+// Notion rich_text objects.
+function parseRichText(text) {
+  const source = String(text == null ? "" : text);
+  const parts = [];
+  const pattern =
+    /(\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)|\*([^*]+)\*|_([^_]+)_)/g;
+  let last = 0;
+  let match;
+
+  const pushText = (content, annotations, link) => {
+    if (!content) return;
+    const obj = { type: "text", text: { content: content.slice(0, 2000) } };
+    if (link) obj.text.link = { url: link };
+    if (annotations) obj.annotations = annotations;
+    parts.push(obj);
+  };
+
+  while ((match = pattern.exec(source)) !== null) {
+    if (match.index > last) pushText(source.slice(last, match.index));
+    if (match[2] !== undefined) pushText(match[2], { bold: true });
+    else if (match[3] !== undefined) pushText(match[3], { bold: true });
+    else if (match[4] !== undefined) pushText(match[4], { strikethrough: true });
+    else if (match[5] !== undefined) pushText(match[5], { code: true });
+    else if (match[6] !== undefined) pushText(match[6], null, match[7]);
+    else if (match[8] !== undefined) pushText(match[8], { italic: true });
+    else if (match[9] !== undefined) pushText(match[9], { italic: true });
+    last = pattern.lastIndex;
+  }
+  if (last < source.length) pushText(source.slice(last));
+
+  if (parts.length === 0) {
+    return [{ type: "text", text: { content: source.slice(0, 2000) } }];
+  }
+  return parts;
+}
+
+const NOTION_LANGUAGES = {
+  js: "javascript",
+  javascript: "javascript",
+  ts: "typescript",
+  typescript: "typescript",
+  py: "python",
+  python: "python",
+  sh: "shell",
+  bash: "shell",
+  shell: "shell",
+  zsh: "shell",
+  json: "json",
+  html: "html",
+  css: "css",
+  java: "java",
+  go: "go",
+  golang: "go",
+  rust: "rust",
+  sql: "sql",
+  c: "c",
+  cpp: "c++",
+  "c++": "c++",
+  yaml: "yaml",
+  yml: "yaml",
+  md: "markdown",
+  markdown: "markdown",
+};
+
+function normalizeLanguage(lang) {
+  return NOTION_LANGUAGES[(lang || "").toLowerCase()] || "plain text";
+}
+
+// Render a Markdown document (as emitted by the AI) into Notion blocks.
+// Supports headings, bullets (with one nesting level), numbered lists, to-dos,
+// quotes, fenced code blocks, dividers and paragraphs.
+function markdownToBlocks(markdown) {
+  const lines = String(markdown || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n");
+  const blocks = [];
+  const stack = [];
+
+  const attach = (block, indent) => {
+    while (stack.length && indent <= stack[stack.length - 1].indent) stack.pop();
+    if (stack.length === 0) {
+      blocks.push(block);
+      stack.push({ block, indent });
+    } else if (stack.length === 1) {
+      const parent = stack[0].block;
+      parent[parent.type].children = parent[parent.type].children || [];
+      parent[parent.type].children.push(block);
+      stack.push({ block, indent });
+    } else {
+      const parent = stack[1].block;
+      parent[parent.type].children = parent[parent.type].children || [];
+      parent[parent.type].children.push(block);
+    }
+  };
+
+  const simple = (type, content) => ({
+    object: "block",
+    type,
+    [type]: { rich_text: parseRichText(content) },
+  });
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fence = line.match(/^\s*```(\w*)\s*$/);
+    if (fence) {
+      const code = [];
+      i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
+        code.push(lines[i]);
+        i++;
+      }
+      i++;
+      stack.length = 0;
+      blocks.push({
+        object: "block",
+        type: "code",
+        code: {
+          rich_text: [{ type: "text", text: { content: code.join("\n").slice(0, 2000) } }],
+          language: normalizeLanguage(fence[1]),
+        },
+      });
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) {
+      stack.length = 0;
+      i++;
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      stack.length = 0;
+      blocks.push({ object: "block", type: "divider", divider: {} });
+      i++;
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      const type = "heading_" + Math.min(heading[1].length, 3);
+      stack.length = 0;
+      blocks.push(simple(type, heading[2]));
+      i++;
+      continue;
+    }
+
+    const indent = line.match(/^[ \t]*/)[0].replace(/\t/g, "  ").length;
+
+    const todo = trimmed.match(/^[-*+]\s+\[([ xX])\]\s+(.*)$/);
+    if (todo) {
+      attach(
+        {
+          object: "block",
+          type: "to_do",
+          to_do: {
+            rich_text: parseRichText(todo[2]),
+            checked: todo[1].toLowerCase() === "x",
+          },
+        },
+        indent,
+      );
+      i++;
+      continue;
+    }
+
+    const quote = trimmed.match(/^>\s?(.*)$/);
+    if (quote) {
+      stack.length = 0;
+      blocks.push(simple("quote", quote[1]));
+      i++;
+      continue;
+    }
+
+    const numbered = trimmed.match(/^\d+[.)]\s+(.*)$/);
+    if (numbered) {
+      attach(simple("numbered_list_item", numbered[1]), indent);
+      i++;
+      continue;
+    }
+
+    const bullet = trimmed.match(/^[-*•+]\s+(.*)$/);
+    if (bullet) {
+      attach(simple("bulleted_list_item", bullet[1]), indent);
+      i++;
+      continue;
+    }
+
+    stack.length = 0;
+    blocks.push(simple("paragraph", trimmed));
+    i++;
+  }
+
+  return blocks;
+}
+
+// Count blocks including nested children so we never exceed Notion's 100-per-
+// request limit.
+function countBlocks(blocks) {
+  let n = 0;
+  for (const block of blocks) {
+    n++;
+    const payload = block && block[block.type];
+    if (payload && Array.isArray(payload.children)) {
+      n += countBlocks(payload.children);
+    }
+  }
+  return n;
+}
+
+// Return the longest leading slice of `blocks` whose total block count
+// (including nested children) is at most `max`.
+function takeBlocks(blocks, max) {
+  const out = [];
+  let n = 0;
+  for (const block of blocks) {
+    const size = countBlocks([block]);
+    if (n + size > max) break;
+    out.push(block);
+    n += size;
+  }
+  return out;
+}
+
 
 function renderHTML(url) {
   const sharedText =
@@ -522,8 +944,22 @@ function renderHTML(url) {
         const data = await resp.json();
         if (resp.ok && data.success && data.appUrl) {
           statusDiv.style.color = "var(--success)";
-          statusDiv.innerText = "Saved! Opening Notion...";
-          setTimeout(() => { window.location.href = data.appUrl; }, 300);
+          statusDiv.innerText = "✅ Saved! Opening Notion…";
+
+          // 1) Open the newly created Notion page / app via the deep link.
+          try {
+            window.location.href = data.appUrl;
+          } catch (e) {}
+
+          // 2) Auto-close this window. This succeeds when the page runs as an
+          //    installed PWA / share-target window; regular browser tabs may
+          //    refuse to close programmatically, so we leave a hint.
+          setTimeout(() => {
+            try { window.close(); } catch (e) {}
+            setTimeout(() => {
+              statusDiv.innerText = "✅ Saved to Notion. You can close this window.";
+            }, 900);
+          }, 800);
         } else {
           throw new Error(data.error || "Failed to process");
         }

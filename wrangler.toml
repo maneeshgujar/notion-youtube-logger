@@ -4,3 +4,7 @@ compatibility_date = "2024-10-01"
 
 [ai]
 binding = "AI"
+
+# Optional: raise the transcript API rate limit beyond the keyless default.
+# Set it as a secret (do NOT commit it here):
+#   wrangler secret put TRANSCRIPT_API_KEY
