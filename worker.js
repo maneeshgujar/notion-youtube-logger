@@ -148,30 +148,28 @@ export default {
         try {
           const { transcript, description } = await getYouTubeContent(videoId);
 
-          const systemPrompt = `You are an expert study note-taker. 
-Your goal is to extract the core ideas, arguments, and takeaways actually discussed in the video transcript and description.
-Structure your notes so they are quick, simple, and intuitive to review later.
+          // Concise, keyword-anchored system prompt
+          const systemPrompt = `You are a concise technical note-taker. 
+Extract only the essential insights and terminology spoken in the video transcript.
 
-Follow these strict rules:
-1. Identify natural sections/chapters from the flow of discussion. Group points logically.
-2. Bold key terms, mechanisms, statistics, and essential keywords using **keyword**.
-3. Keep bullet points simple, punchy, and clear. Avoid filler phrases, conversational fluff, and generic introductory remarks.
-4. Output ONLY bullet points starting strictly with "- ". Do not use markdown headers (###) inside the bullet points.`;
+Strict Output Rules:
+1. Every bullet must be short, dense, and punchy (maximum 12 to 18 words per line). No paragraphs or run-on sentences.
+2. Bold the specific **key terms**, **metrics**, **tools**, or **mechanisms** discussed.
+3. Eliminate intro filler, meta-talk (e.g., "The speaker discusses", "In this video"), and obvious context.
+4. Output strictly as bullet points starting with "- ". Do not use markdown headers (# or ##).`;
 
           let contextBody = `Video Title: "${videoTitle}"\nURL: ${cleanUrl}\n\n`;
           if (description) {
-            contextBody += `Video Description / Chapters:\n${description}\n\n`;
+            contextBody += `Description / Timestamps:\n${description}\n\n`;
           }
           if (transcript) {
-            contextBody += `Video Transcript:\n${transcript}\n\n`;
-          } else {
-            contextBody += `(No transcript available, base notes on title and description only)\n\n`;
+            contextBody += `Spoken Transcript:\n${transcript}\n\n`;
           }
 
           contextBody +=
             aiMode === "short_summary"
-              ? "Task: Write a concise summary of 4 to 6 punchy bullet points covering the main takeaways and key concepts."
-              : "Task: Write structured, comprehensive study notes broken down by the key themes/chapters discussed in the video. Highlight key terms in bold.";
+              ? "Task: Output exactly 3 to 5 ultra-concise bullet points capturing the core takeaway. Keep each point under 15 words."
+              : "Task: Output structured bullet points grouped by key points/concepts mentioned. Keep each bullet point short, direct, and keyword-heavy.";
 
           const aiResponse = await env.AI.run(
             "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
@@ -180,8 +178,8 @@ Follow these strict rules:
                 { role: "system", content: systemPrompt },
                 { role: "user", content: contextBody },
               ],
-              max_tokens: 1200,
-              temperature: 0.2,
+              max_tokens: 600, // Reduced from 1200 to enforce concise brevity
+              temperature: 0.1, // Lowered for direct, factual extraction without embellishment
             },
           );
 
@@ -262,18 +260,15 @@ Follow these strict rules:
         notionPayload.children = pageBlocks;
       }
 
-      const notionRes = await fetch(
-        "[https://api.notion.com/v1/pages](https://api.notion.com/v1/pages)",
-        {
-          method: "POST",
-          headers: {
-            Authorization: "Bearer " + notionKey,
-            "Content-Type": "application/json",
-            "Notion-Version": "2022-06-28",
-          },
-          body: JSON.stringify(notionPayload),
+      const notionRes = await fetch("https://api.notion.com/v1/pages", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + notionKey,
+          "Content-Type": "application/json",
+          "Notion-Version": "2022-06-28",
         },
-      );
+        body: JSON.stringify(notionPayload),
+      });
 
       const notionData = await notionRes.json();
       if (!notionRes.ok) {
