@@ -155,44 +155,13 @@ export default {
             videoTitle = title;
           }
 
-          // Concise, keyword-anchored system prompt
-          const systemPrompt = `You are an expert technical note-taker who turns video transcripts into clean, well-structured study notes in Markdown.
-
-Formatting rules:
-1. Group related ideas under short section headings written as "## Heading".
-2. Under each heading, use "- " bullets. Use nested bullets with two-space indentation for sub-points.
-3. Use numbered lists "1. " only for sequential steps or rankings.
-4. Bold the **key terms**, **tools**, **metrics**, or **mechanisms** with **double asterisks**.
-5. Wrap exact commands, code, file names, or identifiers in \`backticks\`.
-6. Keep every line short and dense (roughly 8-18 words). No paragraphs, no filler, no meta-talk ("the speaker says", "in this video").
-7. Never repeat the video title or add a top-level "# " heading.`;
-
-          let contextBody = `Video Title: "${videoTitle}"\nURL: ${cleanUrl}\n\n`;
-          if (description) {
-            contextBody += `Description / Timestamps:\n${description}\n\n`;
-          }
-          if (transcript) {
-            contextBody += `Spoken Transcript:\n${transcript}\n\n`;
-          }
-
-          contextBody +=
-            aiMode === "short_summary"
-              ? 'Task: Output 3 to 5 ultra-concise bullets capturing the core takeaway. Start directly with "- " bullets (no headings). Keep each under 15 words.'
-              : "Task: Output structured Markdown study notes using '## ' section headings and '-' bullets (plus nested sub-bullets where useful). Be short, direct, and keyword-heavy.";
-
-          const aiResponse = await env.AI.run(
-            "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
-            {
-              messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: contextBody },
-              ],
-              max_tokens: 800, // Room for a few sections of structured notes
-              temperature: 0.1, // Low, for direct factual extraction
-            },
-          );
-
-          const rawText = aiResponse?.response || "";
+          const rawText = await generateNotes(env.AI, {
+            aiMode,
+            videoTitle,
+            cleanUrl,
+            description,
+            transcript,
+          });
           if (rawText) {
             pageBlocks.push({
               object: "block",
@@ -359,6 +328,124 @@ const ANDROID_VR_CLIENT = {
   gl: "US",
 };
 
+// Safety ceiling only (~60k tokens). Long videos used to be hard-cut at 24k
+// chars, which silently dropped everything past the first ~20-30 minutes.
+const MAX_TRANSCRIPT_CHARS = 200000;
+
+// Each chunk must fit comfortably in the model's input window, so long
+// transcripts are summarized in overlapping map steps and then merged.
+const NOTE_CHUNK_CHARS = 16000;
+
+const NOTES_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8-fast";
+
+const NOTES_SYSTEM_PROMPT = `You are an expert technical note-taker who turns video transcripts into clean, well-structured study notes in Markdown.
+
+Formatting rules:
+1. Group related ideas under short section headings written as "## Heading".
+2. Under each heading, use "- " bullets. Use nested bullets with two-space indentation for sub-points.
+3. Use numbered lists "1. " only for sequential steps or rankings.
+4. Bold the **key terms**, **tools**, **metrics**, or **mechanisms** with **double asterisks**.
+5. Wrap exact commands, code, file names, or identifiers in \`backticks\`.
+6. Keep every line short and dense (roughly 8-18 words). No paragraphs, no filler, no meta-talk ("the speaker says", "in this video").
+7. Never repeat the video title or add a top-level "# " heading.`;
+
+function capTranscript(text) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  return clean.length > MAX_TRANSCRIPT_CHARS
+    ? clean.slice(0, MAX_TRANSCRIPT_CHARS)
+    : clean;
+}
+
+// Split on sentence boundaries near the target size so chunks stay coherent.
+function chunkText(text, size) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (clean.length <= size) return clean ? [clean] : [];
+  const chunks = [];
+  let start = 0;
+  while (start < clean.length) {
+    let end = Math.min(start + size, clean.length);
+    if (end < clean.length) {
+      const dot = clean.lastIndexOf(". ", end);
+      if (dot > start + size * 0.5) end = dot + 1;
+    }
+    const piece = clean.slice(start, end).trim();
+    if (piece) chunks.push(piece);
+    start = end;
+  }
+  return chunks;
+}
+
+async function runNotesModel(ai, userContent, maxTokens) {
+  const res = await ai.run(NOTES_MODEL, {
+    messages: [
+      { role: "system", content: NOTES_SYSTEM_PROMPT },
+      { role: "user", content: userContent },
+    ],
+    max_tokens: maxTokens,
+    temperature: 0.1,
+  });
+  return (res && res.response ? res.response : "").trim();
+}
+
+// Generate study notes for the whole video. Short transcripts are done in one
+// pass; long ones (tech talks, podcasts) are mapped chunk-by-chunk and then
+// reduced into a single de-duplicated document so no segment is dropped.
+async function generateNotes(
+  ai,
+  { aiMode, videoTitle, cleanUrl, description, transcript },
+) {
+  const isShort = aiMode === "short_summary";
+  const header =
+    `Video Title: "${videoTitle}"\nURL: ${cleanUrl}\n\n` +
+    (description ? `Description / Timestamps:\n${description}\n\n` : "");
+
+  const task = isShort
+    ? 'Task: Output 3 to 5 ultra-concise bullets capturing the core takeaway. Start directly with "- " bullets (no headings). Keep each under 15 words.'
+    : "Task: Output structured Markdown study notes using '## ' section headings and '-' bullets (plus nested sub-bullets where useful). Be short, direct, and keyword-heavy.";
+
+  if (!transcript) {
+    return runNotesModel(ai, header + task, isShort ? 300 : 800);
+  }
+
+  if (transcript.length <= NOTE_CHUNK_CHARS) {
+    return runNotesModel(ai, `${header}Spoken Transcript:\n${transcript}\n\n${task}`, isShort ? 400 : 800);
+  }
+
+  const chunks = chunkText(transcript, NOTE_CHUNK_CHARS);
+  const partials = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const mapTask = isShort
+      ? 'Task: List 3 to 5 ultra-concise bullets for THIS segment only. Start directly with "- " bullets, no headings.'
+      : "Task: Extract detailed study notes covering EVERY point in THIS segment. Use '## ' section headings and '-' bullets with nested sub-bullets. Do not omit any point; no preamble.";
+    const userContent = `${header}Spoken Transcript (part ${i + 1} of ${chunks.length}):\n${chunks[i]}\n\n${mapTask}`;
+    try {
+      const notes = await runNotesModel(ai, userContent, isShort ? 300 : 1200);
+      if (notes) partials.push(notes);
+    } catch (e) {
+      console.warn(`Notes chunk ${i + 1} failed:`, e);
+    }
+  }
+
+  if (partials.length === 0) return "";
+  if (partials.length === 1) return partials[0];
+
+  const reduceContent =
+    header +
+    "Below are study notes for each consecutive part of the video, in order. " +
+    "Merge them into ONE coherent, de-duplicated set of study notes that preserves every unique point from every part.\n\n" +
+    partials.map((p, i) => `--- Part ${i + 1} ---\n${p}`).join("\n\n") +
+    (isShort
+      ? '\n\nTask: Output 3 to 5 ultra-concise bullets capturing the core takeaway. Start directly with "- " bullets, no headings.'
+      : "\n\nTask: Output the merged Markdown study notes using '## ' section headings and '-' bullets (nested where useful). Keep it short and keyword-heavy; never drop a unique point.");
+
+  try {
+    return await runNotesModel(ai, reduceContent, isShort ? 400 : 3000);
+  } catch (e) {
+    console.warn("Notes reduce step failed, using concatenated parts:", e);
+    return partials.join("\n\n");
+  }
+}
+
 // Helper: Extract English transcript and description from YouTube video
 async function getYouTubeContent(videoId, transcriptApiKey) {
   let transcript = "";
@@ -374,7 +461,7 @@ async function getYouTubeContent(videoId, transcriptApiKey) {
   //    higher limits via the TRANSCRIPT_API_KEY secret.
   const apiResult = await getFreeTranscript(videoId, transcriptApiKey);
   if (apiResult) {
-    transcript = apiResult.text.substring(0, 24000);
+    transcript = capTranscript(apiResult.text);
     title = apiResult.title;
   }
 
@@ -442,7 +529,7 @@ async function getYouTubeContent(videoId, transcriptApiKey) {
         const transcriptBody = await transcriptRes.text();
         const parsed = parseTranscript(transcriptBody);
         if (parsed) {
-          transcript = parsed.substring(0, 24000);
+          transcript = capTranscript(parsed);
           break;
         }
       } catch (e) {
